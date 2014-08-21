@@ -8,6 +8,7 @@
 @property (nonatomic) NSUInteger port;
 @property (nonatomic) NSOutputStream* outputStream;
 @property (nonatomic, readonly) dispatch_queue_t queue;
+@property (nonatomic, strong) NSMutableArray *messageQueue;
 @end
 
 static NSUInteger kFluentdDefaultPort = 24224;
@@ -68,35 +69,62 @@ static NSUInteger kFluentdDefaultPort = 24224;
   [self.outputStream close];
 }
 
-- (void)connect
-{
-  if(self.outputStream.streamStatus == NSStreamStatusOpen){
-    return;
-  }
-  
-  [self.outputStream open];
+- (void)connect {
+    if([self.outputStream streamStatus] == NSStreamStatusOpen){
+        [self sendMessagesInQueue];
+        return;
+    }
+    if ([self.outputStream streamStatus] == NSStreamStatusError) {
+        [self.outputStream close];
+        [self reconnect];
+    }
+    [self.outputStream open];
 }
 
-- (void)disConnect
-{
-  [self.outputStream close];
+- (void)reconnect {
+    CFWriteStreamRef writeStream;
+    CFStreamCreatePairWithSocketToHost(NULL, (__bridge CFStringRef)self.host, self.port, NULL, &writeStream);
+    self.outputStream = CFBridgingRelease(writeStream);
 }
 
-- (void)post:(NSString *)tag object:(NSDictionary *)object
-{
-  NSNumber* timeStamp = [NSNumber numberWithDouble:[[NSDate date] timeIntervalSince1970]];
-  NSData* msg = [MessagePackPacker pack:@[[self.tagPrefix stringByAppendingFormat:@".%@", tag], timeStamp, object]];
-  
-  dispatch_sync(_queue, ^{
-    [self.outputStream write:msg.bytes maxLength:msg.length];
-  });
+- (void)disConnect {
+    [self.outputStream close];
+}
+
+- (void)post:(NSString *)tag object:(NSDictionary *)object {
+    NSNumber* timeStamp = [NSNumber numberWithDouble:[[NSDate date] timeIntervalSince1970]];
+    NSData* msg = [MessagePackPacker pack:@[[self.tagPrefix stringByAppendingFormat:@".%@", tag], timeStamp, object]];
+    [self sendMessage:msg];
+}
+
+- (void)sendMessage: (NSData*)message {
+    [self connect];
+    dispatch_sync(_queue, ^{
+        if(self.outputStream.streamStatus == NSStreamStatusOpen){
+            [self.outputStream write:message.bytes maxLength:message.length];
+        }else {
+            [self appendMessageToQueue: message];
+        }
+    });
+}
+
+- (void)appendMessageToQueue: (NSData*)message {
+    [self.messageQueue addObject:message];
+}
+
+- (void)sendMessagesInQueue {
+    NSArray *queue = [self.messageQueue copy];
+    for (NSData *message in queue) {
+        [self.messageQueue removeObject:message];
+        [self sendMessage:message];
+    }
 }
 
 #pragma mark - NSStreamDelegate
 
-- (void)stream:(NSStream *)theStream handleEvent:(NSStreamEvent)streamEvent
-{
-  // TODO error handling & reconnect strategy
+- (void)stream:(NSStream *)theStream handleEvent:(NSStreamEvent)streamEvent {
+    NSLog(@"error %lu",streamEvent);
+    [self reconnect];
 }
 
 @end
